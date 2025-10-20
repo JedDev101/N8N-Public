@@ -1,0 +1,898 @@
+{
+  "name": "Automate X",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -208,
+        -64
+      ],
+      "id": "93a464d5-242d-4f1d-8a58-4f1cc3a5e244",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "jsCode": "function cleanHtml(s=''){ return String(s).replace(/<[^>]+>/g,'').replace(/\\s+/g,' ').trim(); }\nfunction hostOf(u){ try { return new URL(u).host.replace(/^www\\./,''); } catch { return ''; } }\nfunction articleIdFromGoogle(link=''){ const m = String(link).match(/\\/articles\\/([A-Za-z0-9\\-_]+)/); return m ? m[1] : ''; }\n\nconst root = $json.data?.rss || $json.rss;\nconst ch = root?.channel?.[0];\nconst items = ch?.item || [];\n\nconst now = Date.now();\nconst DAY = 24*60*60*1000;\n\nconst mapped = items.map(it => {\n  const title = (it.title?.[0] || '').trim();\n  const gLink = (it.link?.[0] || '').trim();\n  const guid  = (it.guid?.[0]?._ || '').trim();\n  const pubDate = it.pubDate?.[0] || '';\n  const pubMs = Date.parse(pubDate);\n  const sourceTag = it.source?.[0];\n  const source_name = (typeof sourceTag === 'string')\n    ? sourceTag.trim()\n    : (sourceTag?._ || '').trim();\n  const publisher_url = (typeof sourceTag === 'object')\n    ? (sourceTag.url?.[0] || '')\n    : '';\n\n  const artId = articleIdFromGoogle(gLink) || guid || title.toLowerCase();\n  const topic_key = `${hostOf(publisher_url)}::${artId}`;\n\n  const summary_raw = (it.description?.[0] || '');\n  const summary_hint = cleanHtml(summary_raw);\n\n  return {\n    title,\n    link: gLink,\n    publisher_url,\n    topic_key,\n    pubDate,\n    pubMs: Number.isFinite(pubMs) ? pubMs : 0,\n    source_name: source_name || hostOf(publisher_url) || 'source',\n    summary_hint,\n  };\n}).filter(r => r.pubMs && (now - r.pubMs) <= DAY); // last 24h only\n\n// dedupe newest-first\nconst seen = new Set();\nconst out = [];\nfor (const r of mapped.sort((a,b)=> b.pubMs - a.pubMs)) {\n  if (!r.title || !r.link || !r.publisher_url || !r.topic_key) continue;\n  if (seen.has(r.topic_key)) continue;\n  seen.add(r.topic_key);\n  out.push(r);\n}\n\nreturn out.slice(0, 30).map(x => ({ json: x }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        -64
+      ],
+      "id": "48463f36-24a7-420e-9254-31af16144b79",
+      "name": "Normalize & Pick Top 20"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { items: items.map(i=>i.json) } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        48,
+        304
+      ],
+      "id": "58f91f46-6641-4c48-a146-c8976be00402",
+      "name": "Build LLM Payload"
+    },
+    {
+      "parameters": {
+        "dataPropertyName": "=data",
+        "options": {
+          "explicitArray": true
+        }
+      },
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        480,
+        -64
+      ],
+      "id": "42f67021-fa12-48a4-8d7f-c466366289bf",
+      "name": "XML"
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = $json;\nconst errs = [];\n\nif (!out || typeof out !== 'object') errs.push('No JSON object');\nif (!Array.isArray(out.singles)) errs.push('\"singles\" must be array');\n\nconst singles = out.singles || [];\n\nif (singles.length !== 8) errs.push('singles must be exactly 8');\n\n// uniqueness check\nconst seen = new Set();\nfunction checkSingle(t) {\n  if (!t || t.kind !== 'single') return 'single wrong kind';\n  if (!t.text) return 'single missing text';\n  if (t.text.length < 230 || t.text.length > 270) return 'single text wrong length';\n  for (const k of ['topic_key','source_name','source_url']) if (!t[k]) return `single missing ${k}`;\n  if (seen.has(t.topic_key)) return 'duplicate topic_key';\n  seen.add(t.topic_key);\n  return null;\n}\n\nsingles.forEach((t, i) => { const e = checkSingle(t); if (e) errs.push(`singles[${i}]: ${e}`); });\n\nreturn [{ json: { ok: errs.length === 0, errors: errs, payload: { singles } } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        32,
+        672
+      ],
+      "id": "34331853-9521-48c9-8714-b98276741c01",
+      "name": "Validate to Schema"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "==You are given eligible topics (array of objects). Produce exactly 8 singles. No threads.\n\nCRITICAL RULES\n1) For each single, copy topic_key, source_name, and source_url exactly from one provided item. Do not invent, transform, or leave blank.\n2) Do not repeat the same topic_key.\n3) Style: thought-provoking, human, British spelling, no emojis, no hashtags.\n4) Length: each single must be 230–270 characters (inclusive).\n5) Use only content that plausibly relates to the item’s title/summary.\n6) Not too formal, use common language. Use a question at the end of most posts.\n\nProvided items:\n{{ JSON.stringify($json.items ?? $items.map(i => i.json), null, 2) }}\n\nOutput JSON only—no commentary. Fill the skeleton; do not add or remove keys:\n\n{\n  \"singles\": [\n    {\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"},\n    {\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"},\n    {\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"},\n    {\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"},\n\n{\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"},\n\n{\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"},\n\n{\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"},\n\n{\"kind\":\"single\",\"text\":\"\",\"topic_key\":\"\",\"source_name\":\"\",\"source_url\":\"\"}\n\n  ]\n}\n",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are a rigorous content generator. You must follow schema and counts exactly. If you cannot meet a rule with available items, choose different items instead of breaking the rule.\n\nCreate the content in a way that sounds like a human and is thought provoking, not just reciting information. Make SLIGHTLY opinionated."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        272,
+        304
+      ],
+      "id": "9462c9a1-4d3d-4db4-92bd-f6df0696c84d",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {
+          "frequencyPenalty": 0.2,
+          "maxTokens": 10000,
+          "responseFormat": "json_object",
+          "temperature": 0.8,
+          "topP": 0.9
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAzureOpenAi",
+      "typeVersion": 1,
+      "position": [
+        272,
+        496
+      ],
+      "id": "5e1a40fe-b47b-4074-bc54-dd173d99b0bb",
+      "name": "Azure OpenAI Chat Model"
+    },
+    {
+      "parameters": {
+        "jsCode": "let raw = $json;\nif (typeof raw !== 'string') {\n  if (raw.choices?.[0]?.message?.content) raw = raw.choices[0].message.content;\n  else if (raw.text) raw = raw.text;\n  else raw = JSON.stringify(raw);\n}\n\n// strip any accidental code fences\nraw = raw.replace(/^```(?:json)?\\s*|\\s*```$/g, '');\n\n// keep only the first {...}\nconst s = raw.indexOf('{');\nconst e = raw.lastIndexOf('}');\nif (s === -1 || e === -1) return [{ json: { ok:false, error:'no-json-object-found', raw } }];\nraw = raw.slice(s, e + 1);\n\n// escape line breaks that slipped inside strings\nlet out = '', inStr = false, esc = false;\nfor (let i = 0; i < raw.length; i++) {\n  const c = raw[i];\n  if (esc) { out += c; esc = false; continue; }\n  if (c === '\\\\') { out += c; esc = true; continue; }\n  if (c === '\"') { inStr = !inStr; out += c; continue; }\n  if (inStr && (c === '\\n' || c === '\\r')) { out += '\\\\n'; continue; }\n  out += c;\n}\n// remove trailing commas\nout = out.replace(/,\\s*([}\\]])/g, '$1');\n\nlet parsed;\ntry { parsed = JSON.parse(out); }\ncatch (e) { return [{ json: { ok:false, error:'json-parse-failed', message:String(e), cleaned: out } }]; }\n\nreturn [{ json: parsed }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        304
+      ],
+      "id": "d840636c-42d8-4820-acb9-9b91ac8655b7",
+      "name": "Clean & Parse JSON"
+    },
+    {
+      "parameters": {
+        "jsCode": "function isoNow() { \n  return new Date().toISOString(); \n}\nfunction day() { \n  return new Date().toISOString().slice(0,10); \n}\nfunction makeUid(prefix, i) {\n  // deterministic enough for batch runs\n  const rnd = Math.random().toString(36).slice(2,8);\n  return `${prefix}-${String(i).padStart(2,'0')}-${rnd}`;\n}\n\nconst singles = $json.payload?.singles || [];\nconst batch_date = day();\nconst batch_id = `${batch_date}-${Date.now()}`;\n\nconst rows = [];\n\nfor (let i = 0; i < singles.length; i++) {\n  const t = singles[i];\n  const row_uid = makeUid(batch_id, i);\n\n  rows.push({\n    row_uid,                     // ✅ generated here\n    batch_date,\n    kind: 'single',\n    thread_id: '',\n    part_index: '',\n    text: t.text,\n    topic_key: t.topic_key,\n    source_name: t.source_name,\n    source_url: t.source_url,\n    approved: '',\n    scheduled_time: '',\n    status: 'staging',           // awaiting human review\n    created_at: isoNow(),\n    notified: '',\n    x_post_id: '',\n    posted_at: ''\n  });\n}\n\nreturn rows.map(r => ({ json: r }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        672
+      ],
+      "id": "3cbe087b-8318-4fe5-8be1-e266508dbbbe",
+      "name": "Flatten Tweets to Rows"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": "YOUR_SHEET_NAME",
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "row_uid",
+              "displayName": "row_uid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "batch_id",
+              "displayName": "batch_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "idx_in_batch",
+              "displayName": "idx_in_batch",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "text",
+              "displayName": "text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part1",
+              "displayName": "part1",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part2",
+              "displayName": "part2",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part3",
+              "displayName": "part3",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part4",
+              "displayName": "part4",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part5",
+              "displayName": "part5",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "part6",
+              "displayName": "part6",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "thread_len",
+              "displayName": "thread_len",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "thread_group_id",
+              "displayName": "thread_group_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "topic_key",
+              "displayName": "topic_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_name",
+              "displayName": "source_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_url",
+              "displayName": "source_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reviewer",
+              "displayName": "reviewer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reviewer_notes",
+              "displayName": "reviewer_notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "scheduled_for",
+              "displayName": "scheduled_for",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "posted_at",
+              "displayName": "posted_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "x_tweet_id",
+              "displayName": "x_tweet_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "x_thread_root_id",
+              "displayName": "x_thread_root_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error_last_post",
+              "displayName": "error_last_post",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        464,
+        672
+      ],
+      "id": "aa518080-aa56-4838-b391-69e231ea0ee2",
+      "name": "Append row in sheet"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Removes items whose text exceeds the max length.\n * - singles: uses maxSingle\n * - thread parts: uses maxPart\n * Optionally enforce minimums to drop too-short items as well.\n */\nfunction pruneTooLong(out, { maxSingle=270, maxPart=260, minSingle=0, minPart=0 } = {}) {\n  const cleaned = { singles: [], threads: [] };\n\n  if (Array.isArray(out.singles)) {\n    for (const t of out.singles) {\n      const len = (t?.text || '').length;\n      if (len <= maxSingle && len >= minSingle) cleaned.singles.push(t);\n    }\n  }\n\n  if (Array.isArray(out.threads)) {\n    for (const th of out.threads) {\n      const parts = (th?.parts || []).filter(p => {\n        const len = String(p ?? '').length;\n        return len <= maxPart && len >= minPart;\n      });\n      if (parts.length) cleaned.threads.push({ ...th, parts });\n    }\n  }\n\n  return cleaned;\n}\n\n// ----- usage in n8n -----\nconst llmOut = $json; // this node should receive the parsed LLM JSON\nconst pruned = pruneTooLong(llmOut, { maxSingle: 270, maxPart: 260, minSingle: 230, minPart: 200 });\nreturn [{ json: pruned }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        304
+      ],
+      "id": "11ad73b4-5cec-4de2-99d1-fe116207f612",
+      "name": "Removes Max Length Tweets"
+    },
+    {
+      "parameters": {
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": "YOUR_SHEET_NAME",
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "status",
+              "lookupValue": "staging"
+            },
+            {
+              "lookupColumn": "notified"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        672,
+        672
+      ],
+      "id": "5a6b2f6c-d694-4c7a-9ea6-57da36a2a1ee",
+      "name": "Get row(s) in sheet",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: array of rows from Sheets\nconst rows = $input.all().map(i => i.json);\n\n// Filter to rows that need review\nconst todo = rows.filter(r =>\n  String(r.status).trim().toLowerCase() === 'staging' &&\n  !String(r.notified || '').trim()\n);\n\n// Process in small batches if you want (optional)\n// return todo.slice(0, 10).map(r => ({ json: r }));\nreturn todo.map(r => ({ json: r }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1104,
+        288
+      ],
+      "id": "2c0e2709-0e00-4a11-ab3d-345214fb4172",
+      "name": "Filter Validation"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "Approve ✅",
+                    "additionalFields": {
+                      "callback_data": "=approved:{{$json.row_uid}}"
+                    }
+                  },
+                  {
+                    "text": "Reject ❌",
+                    "additionalFields": {
+                      "callback_data": "=rejected:{{$json.row_uid}}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1264,
+        288
+      ],
+      "id": "e3754886-5133-4234-bf3e-91dceea7c89d",
+      "name": "Send a text message"
+    },
+    {
+      "parameters": {
+        "updates": [
+          "callback_query",
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1424,
+        672
+      ],
+      "id": "a5750bab-5fbd-4317-9afe-bf435256575a",
+      "name": "Approval Process"
+    },
+    {
+      "parameters": {
+        "workflowId": "YOUR_WORKFLOW_ID",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "callback_query_id": "={{ $('Approval Process').item.json.callback_query.id }}",
+            "callback_query_message_chat_id": "={{ $('Approval Process').item.json.callback_query.message.chat.id }}",
+            "callback_query_message_message_id": "={{ $('Approval Process').item.json.callback_query.message.message_id }}",
+            "callback_query_message_text": "={{ $('Approval Process').item.json.callback_query.message.text }}",
+            "callback_query": "={{ $json.callback_query }}",
+            "message": "={{ $json.message }}"
+          },
+          "matchingColumns": [
+            "callback_query_id",
+            "callback_query_message_chat_id",
+            "callback_query_message_message_id",
+            "callback_query_message_text",
+            "callback_query",
+            "message"
+          ],
+          "schema": [
+            {
+              "id": "callback_query_id",
+              "displayName": "callback_query_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_query_message_chat_id",
+              "displayName": "callback_query_message_chat_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_query_message_message_id",
+              "displayName": "callback_query_message_message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_query_message_text",
+              "displayName": "callback_query_message_text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "callback_query",
+              "displayName": "callback_query",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        -944,
+        672
+      ],
+      "name": "Call Telegram Messaging",
+      "id": "5564b958-e35c-41aa-b13d-9d81c0c6d1ec"
+    },
+    {
+      "parameters": {
+        "content": "## Get News for Tweets",
+        "height": 272,
+        "width": 1728
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -528,
+        -112
+      ],
+      "id": "58a103f0-6139-43e4-a535-9d62f1544c84",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Generate AI Tweets\n",
+        "height": 432,
+        "width": 1504,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -528,
+        176
+      ],
+      "id": "28e68a19-2b99-40a4-8fcc-7b7a08ee8c52",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "## Validating and Sending to Google Sheets",
+        "height": 272,
+        "width": 1504,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -528,
+        624
+      ],
+      "id": "110a3e42-f982-4fa6-b2b6-ec15afc6914c",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "content": "## Send Tweet to Telegram\n",
+        "height": 320,
+        "width": 496,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        992,
+        176
+      ],
+      "id": "cd5bf84d-2b6e-4cf7-8492-28bc818aa3f4",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "aae39533-bf15-4e19-bb85-6eb8c35bff05",
+              "name": "gn_url",
+              "value": "https://news.google.com/rss/search?q=(AI%20OR%20%22artificial%20intelligence%22%20OR%20LLM%20OR%20%22generative%20AI%22%20OR%20%22machine%20learning%22)%20(EU%20AI%20Act%20OR%20policy%20OR%20security%20OR%20research%20OR%20product%20OR%20open-source%20OR%20enterprise)%20when%3A1d&hl=en-GB&gl=GB&ceid=GB%3Aen\n",
+              "type": "string"
+            },
+            {
+              "id": "3787210b-614e-4287-82fe-b0090b44a74d",
+              "name": "topic_mix_hint",
+              "value": "news, how-to, case-study, myth-buster, research-to-business",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        0,
+        -64
+      ],
+      "id": "d5233731-6184-4d0c-8d93-94b2da89ee33",
+      "name": "Set News URL & Topics"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.gn_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        272,
+        -64
+      ],
+      "id": "598349f7-d741-4663-a5e1-cbc59b1bea35",
+      "name": "News Request"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Set News URL & Topics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Pick Top 20": {
+      "main": [
+        [
+          {
+            "node": "Build LLM Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "XML": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Pick Top 20",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM Payload": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate to Schema": {
+      "main": [
+        [
+          {
+            "node": "Flatten Tweets to Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Azure OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Clean & Parse JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean & Parse JSON": {
+      "main": [
+        [
+          {
+            "node": "Removes Max Length Tweets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten Tweets to Rows": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Removes Max Length Tweets": {
+      "main": [
+        [
+          {
+            "node": "Validate to Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet": {
+      "main": [
+        [
+          {
+            "node": "Filter Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Validation": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Process": {
+      "main": [
+        [
+          {
+            "node": "Call Telegram Messaging",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Telegram Messaging": {
+      "main": [
+        [
+          {
+            "node": "Set News URL & Topics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set News URL & Topics": {
+      "main": [
+        [
+          {
+            "node": "News Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "News Request": {
+      "main": [
+        [
+          {
+            "node": "XML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "public-template-AutomateX",
+  "tags": []
+}
